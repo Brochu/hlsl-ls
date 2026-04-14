@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, Read, Write, stderr};
 use std::path::PathBuf;
 use std::process::exit;
+use std::str::FromStr;
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::thread;
@@ -23,7 +24,7 @@ fn spawn_worker() -> Sender<CompileRequest> {
     thread::spawn(move || {
         // recv() blocks until a request arrives. Will only stop looping after all Senders are closed
         while let Ok(req) = rx.recv() {
-            writeln!(stderr(), "[hlsl-ls] compiling {:?}", req.path).unwrap();
+            writeln!(stderr(), "[hlsl-ls] compiling {:?} using dxc found at {DXC_PATH:?}", req.path).unwrap();
             // TODO: Will need to parse file to capture entry point of shader and target at least
             //  Start with custom comment header, fallback to heuristic parsing if not available
             // TODO: invoke dxc, publish diagnostics back over stdout
@@ -147,9 +148,10 @@ fn did_open_handler(work_tx: &Sender<CompileRequest>, params: &Value) {
     let str_params = serde_json::to_string(params).unwrap();
     match serde_json::from_str::<lsp_types::DidOpenTextDocumentParams>(&str_params) {
         Ok(p) => {
-            writeln!(stderr(), "[hlsl-ls] textDoc/didOpen: {p:?}").unwrap();
-            // TODO: could trigger an initial compile here so diagnostics
-            //work_tx.send(CompileRequest { path: from_str("").unwrap() }).unwrap();
+            match PathBuf::from_str(p.text_document.uri.as_str()) {
+                Ok(path) => { work_tx.send(CompileRequest { path }).unwrap(); }
+                _ => (),
+            }
         },
         Err(_) => { panic!("[hlsl-ls] Could not parse textDocument/didOpen parameters") },
     }
@@ -159,9 +161,10 @@ fn did_save_handler(work_tx: &Sender<CompileRequest>, params: &Value) {
     let str_params = serde_json::to_string(params).unwrap();
     match serde_json::from_str::<lsp_types::DidSaveTextDocumentParams>(&str_params) {
         Ok(p) => {
-            writeln!(stderr(), "[hlsl-ls] textDoc/didSave: {p:?}").unwrap();
-            // TODO: extract path and push a CompileRequest onto work_tx
-            //work_tx.send(CompileRequest { path: from_str("").unwrap() }).unwrap();
+            match PathBuf::from_str(p.text_document.uri.as_str()) {
+                Ok(path) => { work_tx.send(CompileRequest { path }).unwrap(); }
+                _ => (),
+            }
         },
         Err(_) => { panic!("[hlsl-ls] Could not parse textDocument/didSave parameters") },
     }
