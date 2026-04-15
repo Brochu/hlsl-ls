@@ -1,12 +1,18 @@
-use std::io::{self, BufRead, Read, Write, stderr};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::str::FromStr;
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::thread;
 
-use serde_json::{ Value };
+use serde_json::Value;
+
+macro_rules! log_err {
+    ($($arg:tt)*) => {
+        let _ = std::io::stderr().write_all(format!("{}\n", format_args!($($arg)*)).as_bytes());
+    };
+}
 
 static DXC_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -18,25 +24,92 @@ struct CompileRequest {
     // TODO: Check if we need to pass more info here based on LSP commands
 }
 
+enum ShaderTarget {
+    Vertex,
+    Pixel,
+    Compute,
+    Library,
+}
+
+struct CompileParams {
+    target: ShaderTarget,
+    entry_point: Option<String>,
+}
+
 fn spawn_worker() -> Sender<CompileRequest> {
     let (tx, rx) = mpsc::channel::<CompileRequest>();
 
     thread::spawn(move || {
         // recv() blocks until a request arrives. Will only stop looping after all Senders are closed
         while let Ok(req) = rx.recv() {
-            writeln!(stderr(), "[hlsl-ls] compiling {:?} using dxc found at {DXC_PATH:?}", req.path).unwrap();
-            // TODO: Will need to parse file to capture entry point of shader and target at least
-            //  Start with custom comment header, fallback to heuristic parsing if not available
+            log_err!("[hlsl-ls] compiling {:?} using dxc found at {DXC_PATH:?}", req.path);
+            let params = detect_compile_params(&req.path);
+            let mut cmd_line = vec!["-T"];
+
+            match params.target {
+                ShaderTarget::Vertex => cmd_line.push("vs_"),
+                ShaderTarget::Pixel => cmd_line.push("ps_"),
+                ShaderTarget::Compute => cmd_line.push("cs_"),
+                ShaderTarget::Library => cmd_line.push("lib_"),
+            }
+
+            // TODO: Handle target version
+
+            let entry = params.entry_point.unwrap_or("".to_owned());
+            if entry.len() > 0 {
+                cmd_line.push("-E");
+                cmd_line.push(&entry);
+            }
+
             // TODO: invoke dxc, publish diagnostics back over stdout
+            log_err!("[hlsl-ls] command line params: {:?}", cmd_line);
         }
-        writeln!(stderr(), "[hlsl-ls] worker shutting down").unwrap();
+        log_err!("[hlsl-ls] worker shutting down");
     });
 
     tx
 }
 
+fn detect_compile_params(shader_path: &Path) -> CompileParams {
+    // TODO: Will need to parse file to capture entry point of shader and target at least
+    //  Start with custom comment header, fallback to heuristic parsing if not available
+    let shader_file = match File::open(shader_path) {
+        Ok(f) => f,
+        Err(_) => {
+            log_err!("[hlsl-ls] Error opening file: {}; default to library shader target", shader_path.display());
+            return CompileParams { target: ShaderTarget::Library, entry_point: None };
+        },
+    };
+
+    let reader = BufReader::new(shader_file);
+    let mut target = ShaderTarget::Library;
+    let mut entry_point = None;
+
+    for file_line in reader.lines() {
+        let line = match file_line {
+            Ok(l) => l,
+            Err(_) => {
+                log_err!("[hlsl-ls] Error reading file: {}", shader_path.display());
+                break;
+            },
+        };
+
+        if let Some(_header) = line.strip_prefix("// hlsl-ls:") {
+            // Found owr own header format; parse, set values and break
+            break;
+        }
+
+        // Keep searching for possible heuristics to detect shader target / entry point
+
+        target = ShaderTarget::Library;
+        entry_point = None;
+    }
+
+    return CompileParams { target, entry_point };
+}
+
 fn main() {
-    writeln!(stderr(), "[hlsl-ls] Starting language server ...").unwrap();
+    log_err!("[hlsl-ls] Starting language server ...");
 
     let work_tx = spawn_worker();
 
@@ -66,7 +139,7 @@ fn main() {
         let msg: serde_json::Value = match serde_json::from_slice(&cmd_buf) {
             Ok(v) => v,
             Err(e) => {
-                writeln!(stderr(), "[hlsl-ls] malformed JSON-RPC body: {e}").unwrap();
+                log_err!("[hlsl-ls] malformed JSON-RPC body: {e}");
                 continue;
             }
         };
@@ -74,7 +147,7 @@ fn main() {
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = msg.get("id");
 
-        writeln!(stderr(), "[hlsl-ls] recv method={method:?} id={id:?}").unwrap();
+        log_err!("[hlsl-ls] recv method={method:?} id={id:?}");
 
         match method {
             "initialize" => { init_handler(id.unwrap(), msg.get("params").unwrap()); }
@@ -84,19 +157,11 @@ fn main() {
             "shutdown" => { shutdown_handler(id.unwrap()); }
             "exit" => { exit_handler(); }
             name => {
-                writeln!(stderr(), "[hlsl-ls] Cannot handle method name {name}!").unwrap();
+                log_err!("[hlsl-ls] Cannot handle method name {name}!");
                 continue;
             }
         }
     }
-}
-
-fn write_to_client(msg: &impl serde::Serialize) {
-    let body = serde_json::to_string(msg).unwrap();
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    write!(stdout, "Content-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
-    stdout.flush().unwrap();
 }
 
 fn init_handler(id: &Value, obj: &Value) {
@@ -107,19 +172,21 @@ fn init_handler(id: &Value, obj: &Value) {
                 .as_ref()
                 .and_then(|opts| opts.get("dxc_path"))
                 .and_then(|v| v.as_str())
-                .and_then(|s| Some(s.trim()))
+                .map(|s| s.trim())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("dxc"));
 
-            writeln!(stderr(), "[hlsl-ls] dxc path: {}", dxc_path.display()).unwrap();
+            log_err!("[hlsl-ls] dxc path: {}", dxc_path.display());
             DXC_PATH.set(dxc_path).expect("[hlsl-ls] init_handler called twice");
 
             let capabilities = lsp_types::ServerCapabilities {
                 text_document_sync: Some(lsp_types::TextDocumentSyncCapability::Options(lsp_types::TextDocumentSyncOptions {
                     save: Some(lsp_types::TextDocumentSyncSaveOptions::Supported(true)),
                     open_close: Some(true),
+
                     ..Default::default()
                     })),
+
                 ..Default::default()
             };
 
@@ -148,10 +215,10 @@ fn did_open_handler(work_tx: &Sender<CompileRequest>, params: &Value) {
     let str_params = serde_json::to_string(params).unwrap();
     match serde_json::from_str::<lsp_types::DidOpenTextDocumentParams>(&str_params) {
         Ok(p) => {
-            match PathBuf::from_str(p.text_document.uri.as_str()) {
-                Ok(path) => { work_tx.send(CompileRequest { path }).unwrap(); }
-                _ => (),
-            }
+            let path_str = p.text_document.uri.path().as_str();
+            let path_str = path_str.strip_prefix('/').unwrap_or(path_str); // Windows drive letter fix
+            let path = PathBuf::from(path_str);
+            work_tx.send(CompileRequest { path }).unwrap();
         },
         Err(_) => { panic!("[hlsl-ls] Could not parse textDocument/didOpen parameters") },
     }
@@ -161,10 +228,10 @@ fn did_save_handler(work_tx: &Sender<CompileRequest>, params: &Value) {
     let str_params = serde_json::to_string(params).unwrap();
     match serde_json::from_str::<lsp_types::DidSaveTextDocumentParams>(&str_params) {
         Ok(p) => {
-            match PathBuf::from_str(p.text_document.uri.as_str()) {
-                Ok(path) => { work_tx.send(CompileRequest { path }).unwrap(); }
-                _ => (),
-            }
+            let path_str = p.text_document.uri.path().as_str();
+            let path_str = path_str.strip_prefix('/').unwrap_or(path_str); // Windows drive letter fix
+            let path = PathBuf::from(path_str);
+            work_tx.send(CompileRequest { path }).unwrap();
         },
         Err(_) => { panic!("[hlsl-ls] Could not parse textDocument/didSave parameters") },
     }
@@ -180,4 +247,12 @@ fn shutdown_handler(id: &Value) {
 
 fn exit_handler() {
     exit(0);
+}
+
+fn write_to_client(msg: &impl serde::Serialize) {
+    let body = serde_json::to_string(msg).unwrap();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write!(stdout, "Content-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+    stdout.flush().unwrap();
 }
