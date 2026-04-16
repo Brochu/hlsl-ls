@@ -36,6 +36,7 @@ enum ShaderTarget {
 
 struct CompileParams {
     target: ShaderTarget,
+    //shader_model: String,
     entry_point: Option<String>,
 }
 
@@ -48,6 +49,7 @@ fn spawn_worker() -> Sender<CompileRequest> {
             log_err!("[hlsl-ls] compiling {:?} using dxc found at {DXC_PATH:?}", req.path);
             let params = detect_compile_params(&req.path);
 
+            // TODO: Get the shader model from the params if there is one set
             let sm = MAX_SHADER_MODELS.get()
                 .and_then(|m| m.get(&params.target))
                 .map(|s| s.as_str())
@@ -141,15 +143,31 @@ fn detect_compile_params(shader_path: &Path) -> CompileParams {
             },
         };
 
-        if let Some(_header) = line.strip_prefix("// hlsl-ls:") {
-            // Found owr own header format; parse, set values and break
-            break;
+        if let Some(header) = line.strip_prefix("//hlsl-ls ") {
+            let (key, val) = match header.split_once(" ") {
+                Some((k, v)) => (k, v),
+                None => { continue; },
+            };
+            log_err!("[hlsl-ls] HLSL-LS Config Line = ({}, {})", key, val);
+
+            if key.starts_with("target") {
+                target = match val {
+                    v if v.starts_with("vs") => ShaderTarget::Vertex,
+                    v if v.starts_with("ps") => ShaderTarget::Pixel,
+                    v if v.starts_with("cs") => ShaderTarget::Compute,
+                    _ => ShaderTarget::Library,
+                }
+            }
+            else if key.starts_with("entry") {
+                entry_point = Some(val.to_owned());
+            }
+        } else {
+            // Keep searching for possible heuristics to detect shader target / entry point
+            /*
+            target = ShaderTarget::Library;
+            entry_point = None;
+            */
         }
-
-        // Keep searching for possible heuristics to detect shader target / entry point
-
-        target = ShaderTarget::Library;
-        entry_point = None;
     }
 
     return CompileParams { target, entry_point };
