@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::exit;
+use std::process::{exit, Command};
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::thread;
@@ -15,6 +16,7 @@ macro_rules! log_err {
 }
 
 static DXC_PATH: OnceLock<PathBuf> = OnceLock::new();
+static MAX_SHADER_MODELS: OnceLock<HashMap<ShaderTarget, String>> = OnceLock::new();
 
 const SERVER_NAME: &str = env!("CARGO_PKG_NAME");
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -24,6 +26,7 @@ struct CompileRequest {
     // TODO: Check if we need to pass more info here based on LSP commands
 }
 
+#[derive(Debug, Hash, Eq, PartialEq, Copy, Clone)]
 enum ShaderTarget {
     Vertex,
     Pixel,
@@ -44,21 +47,26 @@ fn spawn_worker() -> Sender<CompileRequest> {
         while let Ok(req) = rx.recv() {
             log_err!("[hlsl-ls] compiling {:?} using dxc found at {DXC_PATH:?}", req.path);
             let params = detect_compile_params(&req.path);
-            let mut cmd_line = vec!["-T"];
 
-            match params.target {
-                ShaderTarget::Vertex => cmd_line.push("vs_"),
-                ShaderTarget::Pixel => cmd_line.push("ps_"),
-                ShaderTarget::Compute => cmd_line.push("cs_"),
-                ShaderTarget::Library => cmd_line.push("lib_"),
-            }
+            let sm = MAX_SHADER_MODELS.get()
+                .and_then(|m| m.get(&params.target))
+                .map(|s| s.as_str())
+                .unwrap_or("6_0");
 
-            // TODO: Handle target version
+            let target = match params.target {
+                ShaderTarget::Vertex => format!("vs_{sm}"),
+                ShaderTarget::Pixel => format!("ps_{sm}"),
+                ShaderTarget::Compute => format!("cs_{sm}"),
+                ShaderTarget::Library => format!("lib_{sm}"),
+            };
 
-            let entry = params.entry_point.unwrap_or("".to_owned());
-            if entry.len() > 0 {
-                cmd_line.push("-E");
-                cmd_line.push(&entry);
+            let mut cmd_line: Vec<String> = vec!["-T".to_owned(), target];
+
+            if let Some(entry) = params.entry_point {
+                if !entry.is_empty() {
+                    cmd_line.push("-E".to_owned());
+                    cmd_line.push(entry);
+                }
             }
 
             // TODO: invoke dxc, publish diagnostics back over stdout
@@ -68,6 +76,45 @@ fn spawn_worker() -> Sender<CompileRequest> {
     });
 
     tx
+}
+
+fn detect_max_shader_models(dxc_path: &Path) -> HashMap<ShaderTarget, String> {
+    let mut result = HashMap::new();
+
+    let output = match Command::new(dxc_path).arg("-help").output() {
+        Ok(o) => o,
+        Err(e) => {
+            log_err!("[hlsl-ls] failed to run `{} -help`: {e}", dxc_path.display());
+            return result;
+        }
+    };
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    let prefixes = [
+        ("vs_6_", ShaderTarget::Vertex),
+        ("ps_6_", ShaderTarget::Pixel),
+        ("cs_6_", ShaderTarget::Compute),
+        ("lib_6_", ShaderTarget::Library),
+    ];
+
+    let mut maxes: HashMap<ShaderTarget, u32> = HashMap::new();
+    for word in help.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        for (prefix, stage) in &prefixes {
+            if let Some(rest) = word.strip_prefix(prefix) {
+                if let Ok(n) = rest.parse::<u32>() {
+                    let slot = maxes.entry(*stage).or_insert(0);
+                    *slot = (*slot).max(n);
+                }
+            }
+        }
+    }
+
+    for (stage, n) in maxes {
+        result.insert(stage, format!("6_{n}"));
+    }
+
+    log_err!("[hlsl-ls] Detected best possible shader models -> {:?}", result);
+    result
 }
 
 fn detect_compile_params(shader_path: &Path) -> CompileParams {
@@ -177,6 +224,10 @@ fn init_handler(id: &Value, obj: &Value) {
                 .unwrap_or_else(|| PathBuf::from("dxc"));
 
             log_err!("[hlsl-ls] dxc path: {}", dxc_path.display());
+
+            let models = detect_max_shader_models(&dxc_path);
+            MAX_SHADER_MODELS.set(models).ok();
+
             DXC_PATH.set(dxc_path).expect("[hlsl-ls] init_handler called twice");
 
             let capabilities = lsp_types::ServerCapabilities {
