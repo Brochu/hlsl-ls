@@ -88,7 +88,10 @@ fn spawn_worker() -> Sender<CompileRequest> {
                 ShaderTarget::Library => format!("lib_{sm}"),
             };
 
-            let mut cmd_line: Vec<String> = vec!["-T".to_owned(), target];
+            let mut cmd_line: Vec<String> = vec![
+                "-T".to_owned(), target,
+                "-Fo".to_owned(), "NUL".to_owned(),
+            ];
 
             if let Some(entry) = params.entry_point {
                 if !entry.is_empty() {
@@ -97,8 +100,33 @@ fn spawn_worker() -> Sender<CompileRequest> {
                 }
             }
 
-            // TODO: invoke dxc, publish diagnostics back over stdout
-            log_err!("[hlsl-ls] command line params: {:?}", cmd_line);
+            let dxc_path = match DXC_PATH.get() {
+                Some(p) => p,
+                None => {
+                    log_err!("[hlsl-ls] DXC_PATH not set, skipping compile");
+                    continue;
+                }
+            };
+
+            log_err!("[hlsl-ls] running: {} {} {}", dxc_path.display(), cmd_line.join(" "), req.path.display());
+
+            let output = match Command::new(dxc_path)
+                .args(&cmd_line)
+                .arg(&req.path)
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    log_err!("[hlsl-ls] failed to invoke dxc: {e}");
+                    continue;
+                }
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log_err!("[hlsl-ls] dxc exit={:?} stdout={} stderr={}", output.status.code(), stdout, stderr);
+
+            // TODO: parse stderr into LSP diagnostics and publish via textDocument/publishDiagnostics
         }
         log_err!("[hlsl-ls] worker shutting down");
     });
@@ -167,6 +195,7 @@ fn detect_compile_params(shader_path: &Path) -> CompileParams {
                 break;
             },
         };
+        let line = line.trim();
 
         if let Some(header) = line.strip_prefix("//hlsl-ls ") {
             let (key, val) = match header.split_once(" ") {
