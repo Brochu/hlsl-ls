@@ -36,7 +36,7 @@ enum ShaderTarget {
 
 struct CompileParams {
     target: ShaderTarget,
-    //shader_model: String,
+    shader_model: Option<String>,
     entry_point: Option<String>,
 }
 
@@ -49,10 +49,10 @@ fn spawn_worker() -> Sender<CompileRequest> {
             log_err!("[hlsl-ls] compiling {:?} using dxc found at {DXC_PATH:?}", req.path);
             let params = detect_compile_params(&req.path);
 
-            // TODO: Get the shader model from the params if there is one set
-            let sm = MAX_SHADER_MODELS.get()
-                .and_then(|m| m.get(&params.target))
-                .map(|s| s.as_str())
+            let sm = params.shader_model.as_deref()
+                .or_else(|| MAX_SHADER_MODELS.get()
+                    .and_then(|m| m.get(&params.target))
+                    .map(|s| s.as_str()))
                 .unwrap_or("6_0");
 
             let target = match params.target {
@@ -120,18 +120,17 @@ fn detect_max_shader_models(dxc_path: &Path) -> HashMap<ShaderTarget, String> {
 }
 
 fn detect_compile_params(shader_path: &Path) -> CompileParams {
-    // TODO: Will need to parse file to capture entry point of shader and target at least
-    //  Start with custom comment header, fallback to heuristic parsing if not available
     let shader_file = match File::open(shader_path) {
         Ok(f) => f,
         Err(_) => {
             log_err!("[hlsl-ls] Error opening file: {}; default to library shader target", shader_path.display());
-            return CompileParams { target: ShaderTarget::Library, entry_point: None };
+            return CompileParams { target: ShaderTarget::Library, shader_model: None, entry_point: None };
         },
     };
 
     let reader = BufReader::new(shader_file);
     let mut target = ShaderTarget::Library;
+    let mut shader_model = None;
     let mut entry_point = None;
 
     for file_line in reader.lines() {
@@ -151,11 +150,18 @@ fn detect_compile_params(shader_path: &Path) -> CompileParams {
             log_err!("[hlsl-ls] HLSL-LS Config Line = ({}, {})", key, val);
 
             if key.starts_with("target") {
-                target = match val {
-                    v if v.starts_with("vs") => ShaderTarget::Vertex,
-                    v if v.starts_with("ps") => ShaderTarget::Pixel,
-                    v if v.starts_with("cs") => ShaderTarget::Compute,
-                    _ => ShaderTarget::Library,
+                let (stage, model) = match val {
+                    v if v.starts_with("vs") => (ShaderTarget::Vertex, v.strip_prefix("vs_")),
+                    v if v.starts_with("ps") => (ShaderTarget::Pixel, v.strip_prefix("ps_")),
+                    v if v.starts_with("cs") => (ShaderTarget::Compute, v.strip_prefix("cs_")),
+                    v if v.starts_with("lib") => (ShaderTarget::Library, v.strip_prefix("lib_")),
+                    _ => (ShaderTarget::Library, None),
+                };
+                target = stage;
+                if let Some(m) = model {
+                    if !m.is_empty() {
+                        shader_model = Some(m.to_owned());
+                    }
                 }
             }
             else if key.starts_with("entry") {
@@ -170,7 +176,7 @@ fn detect_compile_params(shader_path: &Path) -> CompileParams {
         }
     }
 
-    return CompileParams { target, entry_point };
+    return CompileParams { target, shader_model, entry_point };
 }
 
 fn main() {
