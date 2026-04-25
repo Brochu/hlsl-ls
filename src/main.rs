@@ -194,7 +194,13 @@ fn detect_compile_params(shader_path: &Path) -> CompileParams {
                 entry_point.set_locked(val.to_owned());
             }
         } else {
-            // Heuristics go here — use set_heuristic so config lines (Locked) take priority
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("[numthreads") {
+                target.set_heuristic(ShaderTarget::Compute);
+            }
+            if lower.contains("sv_target") {
+                target.set_heuristic(ShaderTarget::Pixel);
+            }
         }
     }
 
