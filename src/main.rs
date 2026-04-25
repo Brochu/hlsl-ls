@@ -40,6 +40,32 @@ struct CompileParams {
     entry_point: Option<String>,
 }
 
+enum ParamValue<T> {
+    None,
+    Value(T),
+    Locked(T),
+}
+
+impl<T> ParamValue<T> {
+    #[allow(dead_code)] // wired up once heuristics land
+    fn set_heuristic(&mut self, v: T) {
+        if !matches!(self, ParamValue::Locked(_)) {
+            *self = ParamValue::Value(v);
+        }
+    }
+
+    fn set_locked(&mut self, v: T) {
+        *self = ParamValue::Locked(v);
+    }
+
+    fn into_option(self) -> Option<T> {
+        match self {
+            ParamValue::None => None,
+            ParamValue::Value(v) | ParamValue::Locked(v) => Some(v),
+        }
+    }
+}
+
 fn spawn_worker() -> Sender<CompileRequest> {
     let (tx, rx) = mpsc::channel::<CompileRequest>();
 
@@ -129,9 +155,9 @@ fn detect_compile_params(shader_path: &Path) -> CompileParams {
     };
 
     let reader = BufReader::new(shader_file);
-    let mut target = ShaderTarget::Library;
-    let mut shader_model = None;
-    let mut entry_point = None;
+    let mut target: ParamValue<ShaderTarget> = ParamValue::Value(ShaderTarget::Library);
+    let mut shader_model: ParamValue<String> = ParamValue::None;
+    let mut entry_point: ParamValue<String> = ParamValue::None;
 
     for file_line in reader.lines() {
         let line = match file_line {
@@ -157,26 +183,26 @@ fn detect_compile_params(shader_path: &Path) -> CompileParams {
                     v if v.starts_with("lib") => (ShaderTarget::Library, v.strip_prefix("lib_")),
                     _ => (ShaderTarget::Library, None),
                 };
-                target = stage;
+                target.set_locked(stage);
                 if let Some(m) = model {
                     if !m.is_empty() {
-                        shader_model = Some(m.to_owned());
+                        shader_model.set_locked(m.to_owned());
                     }
                 }
             }
             else if key.starts_with("entry") {
-                entry_point = Some(val.to_owned());
+                entry_point.set_locked(val.to_owned());
             }
         } else {
-            // Keep searching for possible heuristics to detect shader target / entry point
-            /*
-            target = ShaderTarget::Library;
-            entry_point = None;
-            */
+            // Heuristics go here — use set_heuristic so config lines (Locked) take priority
         }
     }
 
-    return CompileParams { target, shader_model, entry_point };
+    return CompileParams {
+        target: target.into_option().unwrap_or(ShaderTarget::Library),
+        shader_model: shader_model.into_option(),
+        entry_point: entry_point.into_option(),
+    };
 }
 
 fn main() {
